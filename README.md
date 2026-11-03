@@ -1,3 +1,30 @@
+# Block Breaker 3 Unlimited — PS Vita
+
+Port del juego de iOS (Mach-O ARMv7) a PS Vita con un loader propio. Necesitas tu propia copia del IPA; ningún archivo del juego está en este repositorio.
+
+## Pantalla y limitaciones
+
+El juego es **vertical (320x480, proporción 1.5)** y la pantalla de la Vita es **960x544 (1.76)**. Sin deformar la imagen no hay forma de llenar la pantalla entera, así que hay tres modos. **SELECT** los cambia en este orden:
+
+| Modo | Cómo se sostiene la consola | Imagen | Bordes |
+|---|---|---|---|
+| **Centrado** (por defecto) | Horizontal | 362x544, proporción original | Franjas laterales negras (sin relleno ni estirado) |
+| **Tate** | Girada 90° en sentido horario (cruceta/stick arriba) | 816x544 (544x816 vista en vertical), proporción original | Franjas **negras** de 72 px arriba y abajo. Por diseño no se rellenan ni se estiran. |
+| **Estirado** | Horizontal | 960x544 | Ninguno, pero la imagen sale **deformada** (casi 3× más ancha) |
+
+## Controles
+
+- **Pantalla táctil**: igual que en iOS. El toque se ajusta al modo de pantalla activo.
+- **Stick izquierdo / cruceta**: mueven la paleta. En modo Tate la cruceta sigue la orientación girada: **↑ = derecha, ↓ = izquierda**.
+- **X / O / □ / △**: toque en el centro del área de juego (lanzar la bola).
+- **SELECT**: cambia el modo de pantalla.
+
+## Partidas guardadas
+
+Se guardan en `ux0:data/blockbreaker3unlimited/saves/` (`bbd3.sav`, `profile.sav`). Las versiones anteriores al arreglo de `stat` de log_033 no podían cargarlas y las reiniciaban en cada arranque. El progreso de esas versiones se perdió.
+
+---
+
 # iOS Mach-O Loader Boilerplate for PS Vita
 
 A reusable boilerplate and scaffolding framework for porting classic 32-bit iOS games (ARMv6 / ARMv7, 32-bit Mach-O `MH_EXECUTE`) to the PlayStation Vita.

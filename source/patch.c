@@ -3,17 +3,132 @@
  * @brief Game-specific hooks, memory patches, and custom symbol intercepts.
  */
 #include <kubridge.h>
+#include <psp2/io/stat.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
 #include <vitaGL.h>
 
 #include "gles.h"
+#include "hle.h"
 #include "imports.h"
 #include "input.h"
 #include "log.h"
 #include "macho.h"
 #include "patch.h"
+
+// ---------------------------------------------------------------- SFX asset extraction
+// The game's effect system searches for SFX textures (SFX/BallShine_*.tga, SFX/touch_point.tga,
+// etc.) as loose files.  These assets exist inside ires/SFX.bar (a ZIP with 204 entries), but
+// the engine does not know how to open them from there — it only reads the effect definitions
+// (.beff) from the ZIP layer (via EffectLibrary.bar), and expects the textures to be loose files.
+// When not found -> NULL texture -> dummy 1×1 white -> invisible particle effects.
+//
+// Fix: on first launch, extract every .tga / .bmp / .beff / .bdae asset from SFX.bar into
+// BUNDLE_PATH "ires/" as loose files.  A sentinel file prevents re-extraction on later runs.
+
+#define SFX_BAR_PATH  BUNDLE_PATH "ires/SFX.bar"
+#define SFX_MARKER    BUNDLE_PATH "ires/.sfx_extracted"  // skip if already done
+
+static int sfx_ends_with(const char *s, const char *suf) {
+    size_t sl = strlen(s), el = strlen(suf);
+    return sl >= el && strcmp(s + sl - el, suf) == 0;
+}
+
+static void sfx_mkdir_for(const char *path) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { char c = *p; *p = 0; sceIoMkdir(tmp, 0777); *p = c; }
+    }
+}
+
+static void extract_sfx_bar(void) {
+    SceIoStat st;
+    if (sceIoGetstat(SFX_MARKER, &st) >= 0) return; // already extracted on a previous run
+
+    FILE *bar = fopen(SFX_BAR_PATH, "rb");
+    if (!bar) { l_warn("sfx_extract: cannot open " SFX_BAR_PATH); return; }
+
+    l_info("sfx_extract: first-run extraction of SFX.bar ...");
+    int extracted = 0;
+    uint8_t lhdr[30];
+
+    while (fread(lhdr, 1, 30, bar) == 30) {
+        uint32_t sig = (uint32_t)lhdr[0] | (uint32_t)lhdr[1]<<8 |
+                       (uint32_t)lhdr[2]<<16 | (uint32_t)lhdr[3]<<24;
+        if (sig == 0x02014b50 || sig == 0x06054b50) break; // central-dir / EOCD
+        // Accept both standard ZIP signature PK\x03\x04 and Gameloft GBMP signature
+        if (sig != 0x04034b50 && sig != 0x504d4247) {
+            l_warn("sfx_extract: bad ZIP sig %08x", sig);
+            break;
+        }
+
+        uint16_t method    = (uint16_t)lhdr[8]  | (uint16_t)lhdr[9]<<8;
+        uint32_t csize     = (uint32_t)lhdr[18] | (uint32_t)lhdr[19]<<8 |
+                             (uint32_t)lhdr[20]<<16 | (uint32_t)lhdr[21]<<24;
+        uint32_t usize     = (uint32_t)lhdr[22] | (uint32_t)lhdr[23]<<8 |
+                             (uint32_t)lhdr[24]<<16 | (uint32_t)lhdr[25]<<24;
+        uint16_t fname_len = (uint16_t)lhdr[26] | (uint16_t)lhdr[27]<<8;
+        uint16_t extra_len = (uint16_t)lhdr[28] | (uint16_t)lhdr[29]<<8;
+
+        char fname[256] = {0};
+        if (fname_len >= (uint16_t)sizeof(fname)) {
+            fseek(bar, (long)(fname_len + extra_len + csize), SEEK_CUR); continue;
+        }
+        fread(fname, 1, fname_len, bar);
+        fseek(bar, extra_len, SEEK_CUR);
+
+        int is_asset = sfx_ends_with(fname, ".tga")  || sfx_ends_with(fname, ".bmp") ||
+                       sfx_ends_with(fname, ".beff") || sfx_ends_with(fname, ".bdae") ||
+                       sfx_ends_with(fname, ".png");
+        if (!is_asset || usize == 0) { fseek(bar, csize, SEEK_CUR); continue; }
+
+        char outpath1[512], outpath2[512];
+        snprintf(outpath1, sizeof(outpath1), BUNDLE_PATH "ires/%s", fname);
+        snprintf(outpath2, sizeof(outpath2), BUNDLE_PATH "%s", fname);
+
+        uint8_t *cbuf = malloc(csize ? csize : 1);
+        if (!cbuf) { fseek(bar, csize, SEEK_CUR); continue; }
+        fread(cbuf, 1, csize, bar);
+
+        uint8_t *data = NULL; uint32_t dsize = 0;
+        if (method == 0) {
+            data = cbuf; dsize = csize; cbuf = NULL;
+        } else if (method == 8) {
+            uint8_t *ubuf = malloc(usize);
+            if (ubuf) {
+                z_stream z = {0};
+                z.next_in = cbuf; z.avail_in = csize;
+                z.next_out = ubuf; z.avail_out = usize;
+                if (inflateInit2(&z, -15) == Z_OK && inflate(&z, Z_FINISH) == Z_STREAM_END)
+                    { data = ubuf; dsize = z.total_out; }
+                else { free(ubuf); l_warn("sfx_extract: inflate '%s' failed", fname); }
+                inflateEnd(&z);
+            }
+            free(cbuf); cbuf = NULL;
+        } else { free(cbuf); cbuf = NULL; }
+
+        if (data) {
+            sfx_mkdir_for(outpath1);
+            sfx_mkdir_for(outpath2);
+            FILE *out1 = fopen(outpath1, "wb");
+            if (out1) { fwrite(data, 1, dsize, out1); fclose(out1); }
+            FILE *out2 = fopen(outpath2, "wb");
+            if (out2) { fwrite(data, 1, dsize, out2); fclose(out2); }
+            extracted++;
+            free(data);
+        }
+    }
+    fclose(bar);
+
+    // Write sentinel so we skip extraction on future launches.
+    FILE *marker = fopen(SFX_MARKER, "wb");
+    if (marker) fclose(marker);
+    l_info("sfx_extract: done — %d files extracted", extracted);
+}
+
 
 // ---------------------------------------------------------------- dummy intrusive_ptr safety
 // Boost intrusive_ptr::operator->() at 0x6278-0x63b8 asserts (px != 0).
@@ -99,39 +214,6 @@ static void *hook_wrapper_get_mesh_buffer(effect_wrapper *w) {
     return get_buf(w->mesh);
 }
 
-// Archive (PK/GBMP) open-entry-by-name, 0x2cef88. Entries: vector of 48-byte records at +0x10/+0x14,
-// name std::string (COW, char* to data) at record +4.
-static void *hook_zip_open(void *zip, const char *name) {
-    void *r = ((void *(*)(void *, const char *))(MACHO_SLIDE + 0x2cef88))(zip, name);
-    if (!r) {
-        uint8_t *b = *(uint8_t **)((uintptr_t)zip + 0x10), *e = *(uint8_t **)((uintptr_t)zip + 0x14);
-        l_warn("zip open '%s' failed: %d entries, flags 0x%X", name, (int)((e - b) / 48),
-               (unsigned)*(uint32_t *)((uintptr_t)zip + 0xc));
-        for (uint8_t *p = b; p < e && p < b + 48 * 8; p += 48)
-            l_warn("  entry '%s'", *(const char **)(p + 4));
-        // Source = memory stream (vtable 0x4dbed0: +0xc data, +0x18 size, +0x1c pos)? Show where the
-        // 2nd local header should be: record +0xc data offset, record +16 = 30-byte header (csize at +18).
-        uint8_t *src = *(uint8_t **)((uintptr_t)zip + 8);
-        if (b < e && src && *(uint32_t *)src == MACHO_SLIDE + 0x4dbed0) {
-            uint8_t *data = *(uint8_t **)(src + 0xc);
-            uint32_t size = *(uint32_t *)(src + 0x18), next = *(uint32_t *)(b + 0xc);
-            uint32_t csize;
-            memcpy(&csize, b + 16 + 18, 4);
-            next += csize;
-            l_warn("  memstream size %u pos %u, entry0 data@%u csize %u -> next@%u", (unsigned)size,
-                   (unsigned)*(uint32_t *)(src + 0x1c), (unsigned)*(uint32_t *)(b + 0xc), (unsigned)csize,
-                   (unsigned)next);
-            if (next + 8 <= size)
-                l_warn("  bytes@next %02X %02X %02X %02X %02X %02X %02X %02X", data[next], data[next + 1],
-                       data[next + 2], data[next + 3], data[next + 4], data[next + 5], data[next + 6],
-                       data[next + 7]);
-            if (size >= 22) // a fully inflated zip ends with the EOCD record "PK\5\6"
-                l_warn("  bytes@size-22 %02X %02X %02X %02X", data[size - 22], data[size - 21], data[size - 20],
-                       data[size - 19]);
-        }
-    }
-    return r;
-}
 
 void hook_decref_mesh(void *mesh) {
     if (!mesh)
@@ -240,6 +322,33 @@ __attribute__((naked, target("arm"))) static void hook_entry_inflate_trampoline(
     );
 }
 
+// Same guest zlib, used by the static libpng 1.2.32 (PNG loader 0x323598): truncated IDAT -> png_error ->
+// NULL texture -> dummy (invisible bricks/actors/logo, log_031 "x.png Pitch:1 PixelFormat:0"). Send every
+// guest zlib entry point to host zlib; the guest z_stream matches the host one (assert above). Entering
+// through ml_align_call because these are plain guest `bl` sites with a possibly 4-byte aligned sp.
+static void patch_jump_native(uintptr_t addr, void *dst) {
+    extern void ml_align_call(void);
+    const uint32_t thunk[4] = {0xE59FC000, 0xE59FF000, (uint32_t)dst, (uint32_t)ml_align_call};
+    patch_jump(addr, (void *)macho_alloc_code(thunk, 4));
+}
+
+// Guest png error_fn (0x3234e0) only reports to a disabled logger: log libpng's reason, then the same
+// longjmp(png_ptr->jmpbuf, 1) the original does.
+static void hook_png_error(void *png_ptr, const char *msg) {
+    extern void darwin_longjmp(void *, int);
+    l_warn("libpng error: %s", msg);
+    darwin_longjmp(png_ptr, 1);
+}
+
+static void patch_guest_zlib(void) {
+    patch_jump_native(MACHO_SLIDE + 0x3234e0, hook_png_error);
+    patch_jump_native(MACHO_SLIDE + 0x1d8ff0, inflateReset);
+    patch_jump_native(MACHO_SLIDE + 0x1d9068, inflateEnd);
+    patch_jump_native(MACHO_SLIDE + 0x1d90c8, inflateInit2_);
+    patch_jump_native(MACHO_SLIDE + 0x1d9234, inflateInit_);
+    patch_jump_native(MACHO_SLIDE + 0x1d9380, inflate);
+}
+
 // ARMv6 SWP/SWPB is disabled on the Vita's Cortex-A9 (undefined instruction, log_021 at 0x2c1398).
 // Each one becomes `b` to an arena thunk doing the same exchange with ldrex/strex, keeping flags and
 // using three stacked scratch registers.
@@ -296,6 +405,10 @@ const int patch_imports_count = sizeof(patch_imports) / sizeof(patch_imports[0])
 void patch_init(void) {
     l_info("Initializing game-specific patches...");
 
+    // Extract SFX textures from SFX.bar to loose files (first run only, ~2s).
+    // Fixes invisible particle effects (BallShine, touch_point, lockline, etc.).
+    extract_sfx_bar();
+
     pin_empty_string_reps();
     patch_all_swp();
 
@@ -327,9 +440,8 @@ void patch_init(void) {
 
     // Decompress archive entries with host zlib (overwrites 0x2ce5f0 and 0x2ce5f4)
     patch_jump(MACHO_SLIDE + 0x2ce5f0, hook_entry_inflate_trampoline);
+    patch_guest_zlib();
 
-    // Log why archive entry lookups fail (zip/GBMP reader vtable slot 3)
-    patch_write32(MACHO_SLIDE + 0x4dc20c + 0xc, (uint32_t)hook_zip_open);
 }
 
 void patch_frame(void) {
@@ -356,7 +468,7 @@ static void add_touch(int id, int x, int y) {
 }
 
 // Physical controls as synthetic touches in the 320x480 view:
-// - SELECT button -> cycles display mode (Landscape Fullscreen -> Original Centered -> Tate Rotated)
+// - SELECT button -> cycles display mode (Original Centered [default] -> Tate Rotated -> Landscape Fullscreen)
 // - Left stick / D-Pad Left/Right -> drag along the paddle line, stick X = paddle X (id 100)
 // - Cross/Circle/Square/Triangle -> one tap in the middle of the play field (id 101)
 // ponytail: paddle line y=440 and the stick range are guesses; calibrate on console (Gate 3).
@@ -378,12 +490,15 @@ void patch_input(void) {
             stick_val = 255 - pad.ly;
     }
 
+    // Tate (console turned 90 deg clockwise): the player's left/right are the D-pad's Down/Up.
+    int tate = mode == DISPLAY_MODE_TATE_ROTATED;
+    uint32_t pad_left = tate ? SCE_CTRL_DOWN : SCE_CTRL_LEFT, pad_right = tate ? SCE_CTRL_UP : SCE_CTRL_RIGHT;
     static int dpad_x = 160;
-    if (pad.buttons & SCE_CTRL_LEFT) {
+    if (pad.buttons & pad_left) {
         dpad_x -= 6;
         if (dpad_x < 0) dpad_x = 0;
         add_touch(100, dpad_x, 440);
-    } else if (pad.buttons & SCE_CTRL_RIGHT) {
+    } else if (pad.buttons & pad_right) {
         dpad_x += 6;
         if (dpad_x > 319) dpad_x = 319;
         add_touch(100, dpad_x, 440);

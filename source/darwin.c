@@ -62,6 +62,9 @@ const char *darwin_path(const char *in, char *out, size_t outlen) {
             q--;
         memmove(q, p + 4, strlen(p + 4) + 1);
     }
+    for (char *p; (p = strstr(tmp, "/./"));) {
+        memmove(p, p + 2, strlen(p + 2) + 1);
+    }
     static const char docs[] = DATA_PATH "Documents";
     size_t dl = sizeof(docs) - 1;
     static const char bbd3_app[] = DATA_PATH "BBD3.app";
@@ -75,15 +78,66 @@ const char *darwin_path(const char *in, char *out, size_t outlen) {
         snprintf(out, outlen, BUNDLE_PATH "%s", tmp[bl] ? tmp + bl + 1 : "");
     else if (!strncmp(tmp, payload_app, pl) && (tmp[pl] == '/' || !tmp[pl]))
         snprintf(out, outlen, BUNDLE_PATH "%s", tmp[pl] ? tmp + pl + 1 : "");
-    else
+    else {
+        // Transparent fallback: if accessing game_app/SFX/..., check if it exists in game_app/ires/SFX/...
+        static const char app_sfx[] = BUNDLE_PATH "SFX/";
+        size_t sfx_len = sizeof(app_sfx) - 1;
+        if (!strncmp(tmp, app_sfx, sfx_len)) {
+            SceIoStat st;
+            if (sceIoGetstat(tmp, &st) < 0) {
+                char alt[512];
+                snprintf(alt, sizeof(alt), BUNDLE_PATH "ires/SFX/%s", tmp + sfx_len);
+                if (sceIoGetstat(alt, &st) >= 0)
+                    snprintf(tmp, sizeof(tmp), "%s", alt);
+            }
+        }
         snprintf(out, outlen, "%s", tmp);
+    }
     return out;
+}
+
+// The game re-probes the same missing bundle files (.png/.bmp before .tga, sfx_repulsion.wav on every
+// bounce), each a slow ux0 lookup. game_app is read-only, so a miss there stays a miss: remember it.
+static char *miss_tab[1024];
+static pthread_mutex_t miss_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static char **miss_slot(const char *p) { // caller holds miss_lock; NULL when the table is full
+    uint32_t h = 2166136261u;
+    for (const char *c = p; *c; c++)
+        h = (h ^ (uint8_t)*c) * 16777619u;
+    for (int i = 0; i < 1024; i++) {
+        char **e = &miss_tab[(h + i) & 1023];
+        if (!*e || !strcmp(*e, p))
+            return e;
+    }
+    return NULL;
 }
 
 static FILE *d_fopen(const char *path, const char *mode) {
     char p[512];
-    FILE *f = fopen(darwin_path(path, p, sizeof(p)), mode);
-    l_info("fopen(%s -> %s, %s) -> %p", path, p, mode, f);
+    darwin_path(path, p, sizeof(p));
+    int cacheable = mode[0] == 'r' && !strchr(mode, '+') && strstr(p, "/game_app/");
+    if (cacheable) {
+        pthread_mutex_lock(&miss_lock);
+        char **e = miss_slot(p);
+        int known = e && *e;
+        pthread_mutex_unlock(&miss_lock);
+        if (known) {
+            errno = ENOENT;
+            return NULL;
+        }
+    }
+    FILE *f = fopen(p, mode);
+    if (!f) { // successes are every sound effect during gameplay: too many lines
+        l_info("fopen(%s -> %s, %s) -> NULL", path, p, mode);
+        if (cacheable && errno == ENOENT) {
+            pthread_mutex_lock(&miss_lock);
+            char **e = miss_slot(p);
+            if (e && !*e)
+                *e = strdup(p);
+            pthread_mutex_unlock(&miss_lock);
+        }
+    }
     return f;
 }
 
@@ -199,19 +253,23 @@ static void d_exit(int code) {
 
 // ---------------------------------------------------------------- Darwin struct layouts
 
-// Darwin 32-bit struct stat (pre-INODE64 `_stat`): 96 bytes, different from newlib's.
-typedef struct {
+// iOS `_stat` uses the 64-bit-inode layout (108 bytes, 64-bit fields 4-byte aligned on iOS ARM): both save
+// loaders (0x548f0, 0x656a8) read st_size at 0x3c. The old layout put it at 0x30 -> size 0 -> "corrupt" save
+// -> reset and overwritten with defaults on every boot (log_032: rb+ then wb+ 50 ms later).
+typedef struct __attribute__((packed, aligned(4))) {
     int32_t st_dev;
-    uint32_t st_ino;
     uint16_t st_mode, st_nlink;
+    uint64_t st_ino;
     uint32_t st_uid, st_gid;
     int32_t st_rdev;
-    int32_t st_atime_, st_atime_ns, st_mtime_, st_mtime_ns, st_ctime_, st_ctime_ns;
+    int32_t st_atime_, st_atime_ns, st_mtime_, st_mtime_ns, st_ctime_, st_ctime_ns, st_birth_, st_birth_ns;
     int64_t st_size, st_blocks;
     int32_t st_blksize;
-    uint32_t st_flags, st_gen, st_lspare;
+    uint32_t st_flags, st_gen;
+    int32_t st_lspare;
     int64_t st_qspare[2];
 } darwin_stat;
+_Static_assert(__builtin_offsetof(darwin_stat, st_size) == 0x3c && sizeof(darwin_stat) == 108, "iOS stat layout");
 
 static int d_stat(const char *path, darwin_stat *out) {
     char p[512];
@@ -494,6 +552,16 @@ static int d_pthread_create(pthread_t *thr, const void *darwin_attr, void *fn, v
     pthread_attr_setstacksize(&attr, 512 * 1024); // iOS default 512 KB secondary thread stack
     int r = pthread_create(thr, &attr, thread_tramp, t);
     pthread_attr_destroy(&attr);
+    if (r == 0 && thr && *thr) {
+        SceUID uid = -1;
+        uintptr_t val = (uintptr_t)*thr;
+        if ((val & 0xFFFF0000) == 0x40010000)
+            uid = (SceUID)val;
+        else if (val >= 0x81000000 && val < 0x90000000 && (val & 3) == 0)
+            uid = *(SceUID *)val;
+        if (uid > 0)
+            sceKernelChangeThreadCpuAffinityMask(uid, SCE_KERNEL_CPU_MASK_USER_ALL);
+    }
     l_debug("pthread_create(0x%08X) -> %d", (unsigned)fn - MACHO_SLIDE, r);
     return r;
 }

@@ -441,3 +441,51 @@ y adaptado a BBD3. Respaldo del estado anterior fuera del repo (scratchpad de la
   - `pic0.png` (960x544) y `bg0.png` (840x500) generados a partir de `cover.webp` con paleta indexada de 8 bits.
   - `bg0.png` reducido a 119.2 KB para respetar el límite de 128 KB de Sony (`psvita-toolkit livearea --validate` pasa al 100%).
 
+## Fix de elementos gráficos invisibles y optimizaciones de FPS (2026-10-26)
+- **Causa raíz de elementos invisibles**:
+  1. `ires/SFX.bar` es un archivo ZIP empaquetado por Gameloft con firma propietaria `GBMP` (`0x504d4247`) en los cabezales locales en lugar de `PK\x03\x04`. Esto causaba que tanto el motor como los scripts de extracción estándar fallaran al intentar abrir las 204 texturas de efectos de partículas (`SFX/BallShine_*.tga`, `touch_point.tga`, `lockline.tga`, `circle_*.tga`, chispas y explosiones). Al no encontrarse, caían en el fallback de `dummy_texture` blanco/no-op volviéndose invisibles.
+  2. `darwin_path()` no normalizaba secuencias `/./` y `sceIoOpen()` de la PS Vita fallaba al intentar abrir rutas con `/./ires/`.
+  3. Al restaurar estado tras `gles_present()`, `glColor4x` sobrescribía con valores desactualizados los colores establecidos por `glColor4f` / `glColor4ub`.
+- **Fixes de renderizado**:
+  - Extracción completa de los 204 recursos de `SFX.bar` a las carpetas staged `ux0_data/blockbreaker3unlimited/game_app/SFX/` e `ires/SFX/`.
+  - Normalización de `/./` y redirección automática de rutas `SFX/` en `source/darwin.c`.
+  - Soporte de firma `GBMP` en el extractor automático `extract_sfx_bar()` en `source/patch.c`.
+  - Interceptores para `glColor4f` y `glColor4ub` en `source/gles.c` para mantener el estado de color sincronizado.
+- **Optimizaciones de rendimiento (FPS)**:
+  - Eliminación de todas las lecturas síncronas GPU->CPU (`glIsEnabled`, `glGetIntegerv`, `glGetBooleanv`, `glGetFloatv`) en `gles_present()`, reemplazándolas por un caché de sombra local.
+  - Incremento del pool de vértices/VBO de vitaGL de 8 MB a 16 MB.
+  - Habilitación de Triple Buffering (`vglUseTripleBuffering(GL_TRUE)`).
+  - Eliminación del `glClear` innecesario de 960x544 en modo Landscape Fullscreen.
+  - Mapeo de `glFlush` a no-op para evitar stalls de pipeline de GXM.
+  - Overclock de CPU de 444 MHz a 500 MHz en `source/main.c`.
+  - Distribución de afinidad multinúcleo con `SCE_KERNEL_CPU_MASK_USER_ALL` para los hilos secundarios en `source/darwin.c`.
+
+
+## log_031: ladrillos/actores invisibles in-game (PNG del motor → NULL)
+- Síntoma: `9/bricks_all_act1.png`, `9/level_actor.png`, `9/item_effect.png`, `4_S/gameloft_logo.png` imprimen
+  `Pitch:1 PixelFormat:0` = textura dummy del guard de intrusive_ptr; los `.tga` sí cargan.
+- Loader PNG del motor `0x323598` usa libpng 1.2.32 estática, que infla con el zlib estático del guest
+  (el mismo que se cortaba en consola en log_020). Entradas zlib guest: inflateReset `0x1d8ff0`, inflateEnd `0x1d9068`,
+  inflateInit2_ `0x1d90c8`, inflateInit_ `0x1d9234`, inflate `0x1d9380` (únicos targets llamados desde fuera).
+- Fix: `patch_guest_zlib()` redirige las 5 a zlib del host (vía ml_align_call). Además `hook_png_error` (`0x3234e0`)
+  loguea "libpng error: ..." antes del longjmp, para la próxima corrida si quedara algún PNG fallando.
+
+## log_032: PNG OK (`bricks_all_act1.png Pitch:4096 PixelFormat:14`); rendimiento y aspecto
+- FPS: cada efecto de sonido hace un `fopen` del .wav, y cada línea de log se sincronizaba (~9 ms). Ahora sólo se sincronizan
+  WARN+ (`log.c`) y `d_fopen` sólo loguea fallos. `scePowerSetArmClockFrequency(500)` → 444 (500 no es válido en stock).
+- Pantalla: modo por defecto `ORIGINAL_CENTERED` (362x544, sin estirar) con fondo = el mismo frame estirado y oscurecido
+  (un quad extra). SELECT cicla: centrado → Tate → estirado.
+
+## log_033: partidas no se cargaban; más FPS; Tate
+- Saves: ambas rutinas de carga (0x548f0, 0x656a8) hacen fopen(rb+) + stat + malloc(st_size) + fread y leen st_size en
+  0x3c = layout iOS de 64-bit inode (108 bytes). `darwin_stat` tenía el layout viejo (size en 0x30) → size 0 → versión
+  != 8 → reset + wb+ con valores por defecto en cada arranque. Corregido con _Static_assert del offset.
+  ponytail: `readdir` sigue con el dirent viejo (el juego nunca lo llamó en log_032/033).
+- FPS: eliminado `hook_zip_open` (diagnóstico de log_018-020): cada búsqueda fallida en un .bar (normal: el motor prueba
+  .png/.bmp/.tga) escribía hasta 9 WARN sincronizados (~9 ms c/u), miles por sesión.
+- Tate: cruceta ↑/↓ = derecha/izquierda; franjas negras (decisión explícita, documentada en README).
+
+## log_034 — bajones de FPS
+- El juego hace `printf` cada frame (`angle = ...`) y cada `sceIoWrite` a ux0 cuesta ~10 ms aun sin sync: el log INFO ahora va a un buffer en RAM que vacía un hilo de baja prioridad cada 500 ms; WARN/ERROR siguen escribiéndose y sincronizándose al instante.
+- `fopen` de archivos inexistentes dentro de `game_app` (sondeo .png/.bmp antes de .tga, `sfx_repulsion.wav` en cada rebote) se recuerda en una tabla: el segundo intento no toca la SD.
+- Flags del loader: `-mcpu=cortex-a9 -mfpu=neon`.

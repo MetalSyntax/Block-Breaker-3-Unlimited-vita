@@ -48,7 +48,7 @@ include_directories(
 
 # -ffixed-r9: el código de iOS trata r9 como temporal sin guardarlo. Si el loader usara r9,
 # cualquier llamada a/desde el juego lo podría corromper.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -g -ffixed-r9 -mfloat-abi=softfp -DSKIP_SPLASHSCREEN -Wall -Wno-unused-function -D_GNU_SOURCE")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -g -ffixed-r9 -mfloat-abi=softfp -mcpu=cortex-a9 -mfpu=neon -DSKIP_SPLASHSCREEN -Wall -Wno-unused-function -D_GNU_SOURCE")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -ffixed-r9 -mfloat-abi=softfp")
 
 add_executable(${CMAKE_PROJECT_NAME}

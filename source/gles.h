@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 typedef enum {
-    DISPLAY_MODE_LANDSCAPE_FULL = 0,    /**< Stretched to 960x544 (Landscape) [Default]. */
-    DISPLAY_MODE_ORIGINAL_CENTERED = 1, /**< 362x544 centered with black side bars (Aspect Ratio preserved). */
+    DISPLAY_MODE_LANDSCAPE_FULL = 0,    /**< Stretched to 960x544 (Landscape). */
+    DISPLAY_MODE_ORIGINAL_CENTERED = 1, /**< 362x544 centered, aspect preserved, black side bars [Default]. */
     DISPLAY_MODE_TATE_ROTATED = 2       /**< Rotated 90 degrees for holding PS Vita vertically (Tate mode). */
 } display_mode_t;
 

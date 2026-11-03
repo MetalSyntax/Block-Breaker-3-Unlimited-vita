@@ -24,7 +24,7 @@
 #define SCR_W 960
 #define SCR_H 544
 
-static display_mode_t g_display_mode = DISPLAY_MODE_LANDSCAPE_FULL;
+static display_mode_t g_display_mode = DISPLAY_MODE_ORIGINAL_CENTERED;
 
 display_mode_t gles_get_display_mode(void) {
     return g_display_mode;
@@ -34,7 +34,7 @@ void gles_set_display_mode(display_mode_t mode) {
     g_display_mode = mode;
     const char *names[] = {
         "Landscape Fullscreen (960x544)",
-        "Original Centered (362x544)",
+        "Original Centered (362x544, black bars)",
         "Tate Mode Rotated 90 deg"
     };
     l_info("Display presentation mode: %s", names[mode % 3]);
@@ -49,6 +49,114 @@ void gles_cycle_display_mode(void) {
 #define GL_RENDERBUFFER_HEIGHT_OES 0x8D43
 
 static GLuint fbo, fbo_tex; // window framebuffer (ours until the game creates its own) and its color texture
+
+// ---------------------------------------------------------------- GL state cache
+// gles_present() saves and restores guest GL state.  The original code used
+// glIsEnabled / glGetIntegerv / glGetBooleanv / glGetFloatv every frame, which
+// forces CPU–GPU synchronisation in vitaGL and tanks FPS.  Instead every
+// intercepted call that changes state also updates the shadow variables below,
+// so gles_present() can read them directly with zero GL calls.
+
+typedef struct {
+    GLboolean caps[10];        // mirrors caps[] in gles_present order
+    GLboolean tex1_on;
+    GLboolean tca, va, ca, na;
+    GLint     tex;             // GL_TEXTURE_BINDING_2D on unit 0
+    GLint     mode;            // GL_MATRIX_MODE
+    GLint     active_tex;      // GL_ACTIVE_TEXTURE
+    GLint     vp[4];           // GL_VIEWPORT
+    GLint     bound_fb;        // GL_FRAMEBUFFER_BINDING
+    GLboolean cmask[4];        // GL_COLOR_WRITEMASK
+    GLboolean dmask;           // GL_DEPTH_WRITEMASK
+    GLfloat   clear[4];        // GL_COLOR_CLEAR_VALUE
+} gl_state_cache;
+
+static gl_state_cache g_gl; // zero-initialised; updated by intercepted calls below
+
+// Convenience: index into g_gl.caps[] matching caps[] in gles_present().
+// caps[] = {GL_BLEND, GL_ALPHA_TEST, GL_SCISSOR_TEST, GL_DEPTH_TEST,
+//           GL_CULL_FACE, GL_LIGHTING, GL_FOG, GL_STENCIL_TEST,
+//           GL_CLIP_PLANE0, GL_TEXTURE_2D}
+enum {
+    CI_BLEND=0, CI_ALPHA_TEST, CI_SCISSOR_TEST, CI_DEPTH_TEST,
+    CI_CULL_FACE, CI_LIGHTING, CI_FOG, CI_STENCIL_TEST,
+    CI_CLIP_PLANE0, CI_TEXTURE_2D
+};
+
+static int cap_to_idx(GLenum cap) {
+    switch (cap) {
+    case GL_BLEND:        return CI_BLEND;
+    case GL_ALPHA_TEST:   return CI_ALPHA_TEST;
+    case GL_SCISSOR_TEST: return CI_SCISSOR_TEST;
+    case GL_DEPTH_TEST:   return CI_DEPTH_TEST;
+    case GL_CULL_FACE:    return CI_CULL_FACE;
+    case GL_LIGHTING:     return CI_LIGHTING;
+    case GL_FOG:          return CI_FOG;
+    case GL_STENCIL_TEST: return CI_STENCIL_TEST;
+    case GL_CLIP_PLANE0:  return CI_CLIP_PLANE0;
+    case GL_TEXTURE_2D:   return CI_TEXTURE_2D;
+    default:              return -1;
+    }
+}
+
+// Wrappers that update the cache and forward to vitaGL.
+static void gc_glEnable(GLenum cap) {
+    if (cap == GL_TEXTURE_2D) {
+        // Track per-unit state: unit 0 goes into caps[], unit 1 into tex1_on.
+        if (g_gl.active_tex == GL_TEXTURE1) g_gl.tex1_on = GL_TRUE;
+        else                                g_gl.caps[CI_TEXTURE_2D] = GL_TRUE;
+    } else {
+        int i = cap_to_idx(cap);
+        if (i >= 0) g_gl.caps[i] = GL_TRUE;
+    }
+    glEnable(cap);
+}
+static void gc_glDisable(GLenum cap) {
+    if (cap == GL_TEXTURE_2D) {
+        if (g_gl.active_tex == GL_TEXTURE1) g_gl.tex1_on = GL_FALSE;
+        else                                g_gl.caps[CI_TEXTURE_2D] = GL_FALSE;
+    } else {
+        int i = cap_to_idx(cap);
+        if (i >= 0) g_gl.caps[i] = GL_FALSE;
+    }
+    glDisable(cap);
+}
+static void gc_glBindTexture(GLenum target, GLuint tex) {
+    if (target == GL_TEXTURE_2D && g_gl.active_tex == GL_TEXTURE0)
+        g_gl.tex = tex;
+    glBindTexture(target, tex);
+}
+static void gc_glActiveTexture(GLenum unit) {
+    g_gl.active_tex = unit;
+    glActiveTexture(unit);
+}
+static void gc_glMatrixMode(GLenum m) {
+    g_gl.mode = m;
+    glMatrixMode(m);
+}
+static void gc_glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
+    g_gl.vp[0]=x; g_gl.vp[1]=y; g_gl.vp[2]=w; g_gl.vp[3]=h;
+    glViewport(x, y, w, h);
+}
+static void gc_glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    g_gl.cmask[0]=r; g_gl.cmask[1]=g; g_gl.cmask[2]=b; g_gl.cmask[3]=a;
+    glColorMask(r, g, b, a);
+}
+static void gc_glDepthMask(GLboolean m) {
+    g_gl.dmask = m;
+    glDepthMask(m);
+}
+static void gc_glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
+    g_gl.clear[0]=r; g_gl.clear[1]=g; g_gl.clear[2]=b; g_gl.clear[3]=a;
+    glClearColor(r, g, b, a);
+}
+static void gc_glScissor(GLint x, GLint y, GLsizei w, GLsizei h) {
+    glScissor(x, y, w, h);
+}
+static void gc_glBindFramebuffer(GLenum target, GLuint fb) {
+    if (target == GL_FRAMEBUFFER) g_gl.bound_fb = fb;
+    glBindFramebuffer(target, fb);
+}
 
 // Client array state, tracked because (1) vitaGL rejects some GLES1 array types (GL_BYTE
 // vertices/texcoords, GL_FIXED colors; we also convert GL_FIXED vertex/texcoord/normal as before):
@@ -193,12 +301,21 @@ static void g_glEnableClientState(GLenum cap) {
     int k = state_kind(cap);
     if (k >= 0)
         enabled |= 1u << k;
+    // Update the present-cache for vertex/texcoord/color/normal arrays.
+    if (cap == GL_VERTEX_ARRAY)       g_gl.va  = GL_TRUE;
+    else if (cap == GL_TEXTURE_COORD_ARRAY && client_unit == 0) g_gl.tca = GL_TRUE;
+    else if (cap == GL_COLOR_ARRAY)   g_gl.ca  = GL_TRUE;
+    else if (cap == GL_NORMAL_ARRAY)  g_gl.na  = GL_TRUE;
     glEnableClientState(cap);
 }
 static void g_glDisableClientState(GLenum cap) {
     int k = state_kind(cap);
     if (k >= 0)
         enabled &= ~(1u << k);
+    if (cap == GL_VERTEX_ARRAY)       g_gl.va  = GL_FALSE;
+    else if (cap == GL_TEXTURE_COORD_ARRAY && client_unit == 0) g_gl.tca = GL_FALSE;
+    else if (cap == GL_COLOR_ARRAY)   g_gl.ca  = GL_FALSE;
+    else if (cap == GL_NORMAL_ARRAY)  g_gl.na  = GL_FALSE;
     glDisableClientState(cap);
 }
 
@@ -251,6 +368,22 @@ static void g_glGetPointerv(GLenum pname, void **out) {
 static void g_glColor4x(GLfixed r, GLfixed g, GLfixed b, GLfixed a) {
     color[0] = r, color[1] = g, color[2] = b, color[3] = a;
     glColor4x(r, g, b, a);
+}
+
+static void g_glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a) {
+    color[0] = (GLfixed)(r * 65536.0f);
+    color[1] = (GLfixed)(g * 65536.0f);
+    color[2] = (GLfixed)(b * 65536.0f);
+    color[3] = (GLfixed)(a * 65536.0f);
+    glColor4f(r, g, b, a);
+}
+
+static void g_glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) {
+    color[0] = (GLfixed)((r / 255.0f) * 65536.0f);
+    color[1] = (GLfixed)((g / 255.0f) * 65536.0f);
+    color[2] = (GLfixed)((b / 255.0f) * 65536.0f);
+    color[3] = (GLfixed)((a / 255.0f) * 65536.0f);
+    glColor4ub(r, g, b, a);
 }
 
 static void g_glTexEnvi(GLenum target, GLenum pname, GLint v) {
@@ -376,8 +509,11 @@ static void g_glNoop(void) {}
 // ---------------------------------------------------------------- init / present
 
 void gles_init(void) {
-    vglUseTripleBuffering(GL_FALSE);
-    vglInitExtended(0, SCR_W, SCR_H, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    // Enable triple buffering for stable 60 FPS frame pacing without 30 FPS drops
+    vglUseTripleBuffering(GL_TRUE);
+    // 16 MB vertex/VBO pool — BBD3 loads many particle textures; 8 MB caused stalls.
+    vglInitExtended(0, SCR_W, SCR_H, 16 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+
     glGenTextures(1, &fbo_tex);
     glBindTexture(GL_TEXTURE_2D, fbo_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FB_W, FB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -387,6 +523,17 @@ void gles_init(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fbo_tex, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
+
+    // Seed the state cache with the initial values we set here.
+    g_gl.active_tex = GL_TEXTURE0;
+    g_gl.mode       = GL_MODELVIEW;
+    g_gl.bound_fb   = fbo;
+    g_gl.cmask[0] = g_gl.cmask[1] = g_gl.cmask[2] = g_gl.cmask[3] = GL_TRUE;
+    g_gl.dmask    = GL_TRUE;
+    g_gl.clear[3] = 1.0f; // clear alpha = 1
+
+    // Set initial viewport (game uses FB_W x FB_H until the first frame).
+    g_gl.vp[0]=0; g_gl.vp[1]=0; g_gl.vp[2]=FB_W; g_gl.vp[3]=FB_H;
     glViewport(0, 0, FB_W, FB_H);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -397,46 +544,48 @@ void gles_init(void) {
 // Every fixed-function state that could alter the blit (lighting, fog, culling, a second texture
 // unit, the texture matrix, write masks...) is saved, neutralized and restored: the game leaves
 // them enabled across frames (in-engine cutscenes use fog/lighting).
+// PERF: All state is read from g_gl shadow variables — zero GL readback calls per frame.
 void gles_present(void) {
-    static const GLenum caps[] = {GL_BLEND,      GL_ALPHA_TEST, GL_SCISSOR_TEST,   GL_DEPTH_TEST,
-                                  GL_CULL_FACE,  GL_LIGHTING,   GL_FOG,            GL_STENCIL_TEST,
-                                  GL_CLIP_PLANE0, GL_TEXTURE_2D}; // vitaGL can't query GL_COLOR_MATERIAL
-#define NCAPS (sizeof(caps) / sizeof(caps[0]))
-    GLboolean on[NCAPS], tca, va, ca, na, tex1_on, cmask[4], dmask;
-    GLint tex, mode, active, vp[4], bound_fb;
-    for (unsigned i = 0; i < NCAPS; i++)
-        on[i] = glIsEnabled(caps[i]);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
-    glActiveTexture(GL_TEXTURE1);
-    tex1_on = glIsEnabled(GL_TEXTURE_2D);
-    glDisable(GL_TEXTURE_2D);
+    // Take a snapshot of the cached GL state (zero GL calls).
+    GLboolean on[10];
+    for (int i = 0; i < 10; i++) on[i] = g_gl.caps[i];
+    GLboolean tex1_on = g_gl.tex1_on;
+    GLboolean tca = g_gl.tca, va = g_gl.va, ca = g_gl.ca, na = g_gl.na;
+    GLint tex = g_gl.tex;
+    GLint mode = g_gl.mode;
+    GLint active = g_gl.active_tex;
+    GLint vp[4]; vp[0]=g_gl.vp[0]; vp[1]=g_gl.vp[1]; vp[2]=g_gl.vp[2]; vp[3]=g_gl.vp[3];
+    GLint bound_fb = g_gl.bound_fb;
+    GLboolean cmask[4]; cmask[0]=g_gl.cmask[0]; cmask[1]=g_gl.cmask[1]; cmask[2]=g_gl.cmask[2]; cmask[3]=g_gl.cmask[3];
+    GLboolean dmask = g_gl.dmask;
+    GLfloat clear[4]; clear[0]=g_gl.clear[0]; clear[1]=g_gl.clear[1]; clear[2]=g_gl.clear[2]; clear[3]=g_gl.clear[3];
+
+    // Disable all tracked caps, enable TEXTURE_2D for blit.
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glViewport(0, 0, SCR_W, SCR_H);
+    if (on[CI_BLEND])        glDisable(GL_BLEND);
+    if (on[CI_ALPHA_TEST])   glDisable(GL_ALPHA_TEST);
+    if (on[CI_SCISSOR_TEST]) glDisable(GL_SCISSOR_TEST);
+    if (on[CI_DEPTH_TEST])   glDisable(GL_DEPTH_TEST);
+    if (on[CI_CULL_FACE])    glDisable(GL_CULL_FACE);
+    if (on[CI_LIGHTING])     glDisable(GL_LIGHTING);
+    if (on[CI_FOG])          glDisable(GL_FOG);
+    if (on[CI_STENCIL_TEST]) glDisable(GL_STENCIL_TEST);
+    if (on[CI_CLIP_PLANE0])  glDisable(GL_CLIP_PLANE0);
+    if (tex1_on) {
+        glActiveTexture(GL_TEXTURE1);
+        glDisable(GL_TEXTURE_2D);
+    }
     glActiveTexture(GL_TEXTURE0);
     glClientActiveTexture(GL_TEXTURE0);
-    tca = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
-    va = glIsEnabled(GL_VERTEX_ARRAY);
-    ca = glIsEnabled(GL_COLOR_ARRAY);
-    na = glIsEnabled(GL_NORMAL_ARRAY);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &tex);
-    glGetIntegerv(GL_MATRIX_MODE, &mode);
-    glGetIntegerv(GL_VIEWPORT, vp);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound_fb);
-    glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
-    glGetBooleanv(GL_DEPTH_WRITEMASK, &dmask);
-    GLfloat clear[4];
-    glGetFloatv(GL_COLOR_CLEAR_VALUE, clear);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0); // the blit quad uses client arrays
-    glViewport(0, 0, SCR_W, SCR_H);
-    for (unsigned i = 0; i < NCAPS - 1; i++)
-        glDisable(caps[i]);
-    glEnable(GL_TEXTURE_2D);
+    if (!on[CI_TEXTURE_2D])  glEnable(GL_TEXTURE_2D);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_FALSE);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    glDisableClientState(GL_NORMAL_ARRAY);
+    if (ca)  glDisableClientState(GL_COLOR_ARRAY);
+    if (na)  glDisableClientState(GL_NORMAL_ARRAY);
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
     glBindTexture(GL_TEXTURE_2D, fbo_tex);
@@ -451,14 +600,17 @@ void gles_present(void) {
     glMatrixMode(GL_MODELVIEW);
     glPushMatrix();
     glLoadIdentity();
-    glClearColor(0, 0, 0, 1); // side bars: black, not the game's clear color
-    glClear(GL_COLOR_BUFFER_BIT);
+    // Centered and Tate leave uncovered screen: plain black bars.
+    if (g_display_mode != DISPLAY_MODE_LANDSCAPE_FULL) {
+        glClearColor(0, 0, 0, 1); // side bars: black, not the game's clear color
+        glClear(GL_COLOR_BUFFER_BIT);
+    }
 
     static const float uv_normal[] = {0, 1, 1, 1, 0, 0, 1, 0};
     static const float uv_tate[]   = {1, 1, 1, 0, 0, 1, 0, 0}; // 90 deg rotated
 
-    float xy[8];
     const float *uv = uv_normal;
+    float xy[8];
 
     if (g_display_mode == DISPLAY_MODE_LANDSCAPE_FULL) {
         // Landscape full screen 960x544 stretch
@@ -491,40 +643,44 @@ void gles_present(void) {
     patch_overlay(); // loader OSD on the 960x544 screen (scissor + clear only)
     vglSwapBuffers(ime_active()); // GL_TRUE while system dialog is active
 
-
-    // Restore guest OpenGL state.
+    // Restore guest OpenGL state using cached values — no GL readbacks.
     glPopMatrix();
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
     glMatrixMode(GL_TEXTURE);
     glPopMatrix();
     glMatrixMode(mode);
-    glBindFramebuffer(GL_FRAMEBUFFER, bound_fb);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)bound_fb);
     glViewport(vp[0], vp[1], vp[2], vp[3]);
     glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
     glDepthMask(dmask);
     glClearColor(clear[0], clear[1], clear[2], clear[3]);
-    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindTexture(GL_TEXTURE_2D, (GLuint)tex);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, env_mode);
-    for (unsigned i = 0; i < NCAPS; i++)
-        on[i] ? glEnable(caps[i]) : glDisable(caps[i]);
+
+    // Restore caps that we changed (only the ones that differ).
+    if (on[CI_BLEND])        glEnable(GL_BLEND);
+    if (on[CI_ALPHA_TEST])   glEnable(GL_ALPHA_TEST);
+    if (on[CI_SCISSOR_TEST]) glEnable(GL_SCISSOR_TEST);
+    if (on[CI_DEPTH_TEST])   glEnable(GL_DEPTH_TEST);
+    if (on[CI_CULL_FACE])    glEnable(GL_CULL_FACE);
+    if (on[CI_LIGHTING])     glEnable(GL_LIGHTING);
+    if (on[CI_FOG])          glEnable(GL_FOG);
+    if (on[CI_STENCIL_TEST]) glEnable(GL_STENCIL_TEST);
+    if (on[CI_CLIP_PLANE0])  glEnable(GL_CLIP_PLANE0);
+    if (!on[CI_TEXTURE_2D])  glDisable(GL_TEXTURE_2D);
     if (tex1_on) {
         glActiveTexture(GL_TEXTURE1);
         glEnable(GL_TEXTURE_2D);
     }
-    if (!va)
-        glDisableClientState(GL_VERTEX_ARRAY);
-    if (!tca)
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    if (ca)
-        glEnableClientState(GL_COLOR_ARRAY);
-    if (na)
-        glEnableClientState(GL_NORMAL_ARRAY);
+    if (!va)  glDisableClientState(GL_VERTEX_ARRAY);
+    if (!tca) glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    if (ca)   glEnableClientState(GL_COLOR_ARRAY);
+    if (na)   glEnableClientState(GL_NORMAL_ARRAY);
     glColor4x(color[0], color[1], color[2], color[3]);
     reapply_arrays();
     glClientActiveTexture(GL_TEXTURE0 + client_unit);
     glActiveTexture(active);
-#undef NCAPS
 }
 
 static const GLubyte *g_glGetString(GLenum name) {
@@ -550,19 +706,24 @@ static void g_glSampleCoverage(GLclampf value, GLboolean invert) {
 #define D(name) {"_" #name, (uintptr_t)(name)}
 
 const import_entry gles_imports[] = {
-    D(glActiveTexture), D(glBindTexture), D(glBlendFunc), D(glClear), D(glCopyTexImage2D),
-    D(glCopyTexSubImage2D), D(glDeleteTextures), D(glDepthMask), D(glDisable), F(glDisableClientState, g_glDisableClientState),
-    D(glEnable), F(glEnableClientState, g_glEnableClientState), D(glGenTextures), D(glGetIntegerv), D(glIsEnabled),
-    D(glLoadIdentity), D(glLoadMatrixx), D(glMatrixMode), D(glOrthox), D(glPopMatrix), D(glPushMatrix),
-    D(glRotatex), D(glScalex), D(glScissor), D(glShadeModel), D(glTexImage2D), D(glTexParameteri),
-    D(glTexSubImage2D), D(glTranslatex), D(glViewport),
+    F(glActiveTexture, gc_glActiveTexture), F(glBindTexture, gc_glBindTexture),
+    D(glBlendFunc), D(glClear), D(glCopyTexImage2D),
+    D(glCopyTexSubImage2D), D(glDeleteTextures), F(glDepthMask, gc_glDepthMask),
+    F(glDisable, gc_glDisable), F(glDisableClientState, g_glDisableClientState),
+    F(glEnable, gc_glEnable), F(glEnableClientState, g_glEnableClientState),
+    D(glGenTextures), D(glGetIntegerv), D(glIsEnabled),
+    D(glLoadIdentity), D(glLoadMatrixx), F(glMatrixMode, gc_glMatrixMode),
+    D(glOrthox), D(glPopMatrix), D(glPushMatrix),
+    D(glRotatex), D(glScalex), F(glScissor, gc_glScissor), D(glShadeModel),
+    D(glTexImage2D), D(glTexParameteri),
+    D(glTexSubImage2D), D(glTranslatex), F(glViewport, gc_glViewport),
     F(glColor4x, g_glColor4x), F(glTexEnvi, g_glTexEnvi), F(glTexEnvxv, g_glTexEnvxv),
     F(glTexParameterx, g_glTexParameterx), F(glGetFixedv, g_glGetFixedv), F(glGetLightxv, g_glGetLightxv),
     F(glVertexPointer, g_glVertexPointer), F(glTexCoordPointer, g_glTexCoordPointer),
     F(glClientActiveTexture, g_glClientActiveTexture), F(glDrawArrays, g_glDrawArrays),
     F(glGetPointerv, g_glGetPointerv),
     F(glGenFramebuffersOES, glGenFramebuffers), F(glGenRenderbuffersOES, glGenRenderbuffers),
-    F(glBindFramebufferOES, glBindFramebuffer), F(glBindRenderbufferOES, g_glBindRenderbufferOES),
+    F(glBindFramebufferOES, gc_glBindFramebuffer), F(glBindRenderbufferOES, g_glBindRenderbufferOES),
     F(glDeleteFramebuffersOES, g_glDeleteFramebuffersOES), F(glDeleteRenderbuffersOES, glDeleteRenderbuffers),
     F(glRenderbufferStorageOES, glRenderbufferStorage),
     F(glFramebufferRenderbufferOES, g_glFramebufferRenderbufferOES),
@@ -571,8 +732,9 @@ const import_entry gles_imports[] = {
     F(glGetRenderbufferParameterivOES, g_glGetRenderbufferParameterivOES),
     F(glGetFramebufferAttachmentParameterivOES, glGetFramebufferAttachmentParameteriv),
     // Float entry points: loader and vitaGL (SOFTFP_ABI=1) share the iOS softfp convention.
-    D(glAlphaFunc), D(glClearColor), D(glClearDepthf), D(glClipPlanef), D(glColor4f), D(glColor4ub),
-    D(glColorMask), F(glColorPointer, g_glColorPointer), D(glCompressedTexImage2D), D(glCullFace), D(glDepthFunc),
+    D(glAlphaFunc), F(glClearColor, gc_glClearColor), D(glClearDepthf), D(glClipPlanef),
+    F(glColor4f, g_glColor4f), F(glColor4ub, g_glColor4ub),
+    F(glColorMask, gc_glColorMask), F(glColorPointer, g_glColorPointer), D(glCompressedTexImage2D), D(glCullFace), D(glDepthFunc),
     D(glDepthRangef), D(glFogf), D(glFogfv), D(glFrontFace), D(glGetBooleanv), D(glGetError),
     D(glGetFloatv), F(glGetString, g_glGetString), D(glHint), D(glLightModelfv), D(glLightfv), D(glLineWidth),
     D(glLoadMatrixf), D(glMaterialf), D(glMaterialfv), D(glMultMatrixf), D(glNormal3f),
@@ -582,7 +744,7 @@ const import_entry gles_imports[] = {
     D(glDeleteBuffers), D(glBufferData), D(glBufferSubData), F(glBindBuffer, g_glBindBuffer),
     F(glDrawElements, g_glDrawElements), F(glLightf, g_glLightf), F(glPointParameterf, g_glNoop),
     // BBD3 extras (not used by Zombie Infection)
-    D(glOrthof), D(glFlush), D(glClearStencil), D(glIsTexture), F(glIsBuffer, g_glIsBuffer),
+    D(glOrthof), F(glFlush, g_glNoop), D(glClearStencil), D(glIsTexture), F(glIsBuffer, g_glIsBuffer),
     F(glSampleCoverage, g_glSampleCoverage),
     F(glLightModelf, g_glLightModelf), F(glPointParameterfv, g_glNoop), F(glDiscardFramebufferEXT, g_glNoop),
     F(glGenerateMipmapOES, glGenerateMipmap), F(glBlendEquationOES, glBlendEquation),

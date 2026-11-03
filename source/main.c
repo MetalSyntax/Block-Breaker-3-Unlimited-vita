@@ -50,7 +50,7 @@ static int next_log_number(void) {
 }
 
 int main(int argc, char *argv[]) {
-    // Standard PS Vita overclock for optimal emulation frame pacing
+    // 444 MHz is the stock-firmware maximum (higher values are rejected and the CPU stays at 333).
     scePowerSetArmClockFrequency(444);
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);
